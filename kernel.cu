@@ -14,40 +14,21 @@
 #define STEP_Y 0.5
 #define STEP_T 0.1
 
-static double *hostDataX   = nullptr, *hostDataY   = nullptr, *hostDataZ   = nullptr;
-static double *devDataX	   = nullptr, *devDataY    = nullptr, *devDataZ    = nullptr;
-static double *devDataBufX = nullptr, *devDataBufY = nullptr, *devDataBufZ = nullptr;
+static double *hostData = nullptr;
+static double *devData = nullptr, *devBuffer = nullptr;
 
 static void _cpuFree() {
-	if (::hostDataX)
-		std::free((void *)::hostDataX);
-
-	if (::hostDataY)
-		std::free((void *)::hostDataY);
-
-	if (::hostDataZ)
-		std::free((void *)::hostDataZ);
+	if (::hostData)
+		std::free((void *)::hostData);
 }
 
 #define cudaCheck
 static void _gpuFree() {
-	if (::devDataX)
-		cudaCheck(cudaFree((void *)::devDataX));
+	if (::devData)
+		cudaCheck(cudaFree((void *)::devData));
 
-	if (::devDataY)
-		cudaCheck(cudaFree((void *)::devDataY));
-
-	if (::devDataZ)
-		cudaCheck(cudaFree((void *)::devDataZ));
-
-	if (::devDataBufX)
-		cudaCheck(cudaFree((void *)::devDataBufX));
-
-	if (::devDataBufY)
-		cudaCheck(cudaFree((void *)::devDataBufY));
-
-	if (::devDataBufZ)
-		cudaCheck(cudaFree((void *)::devDataBufZ));
+	if (::devBuffer)
+		cudaCheck(cudaFree((void *)::devBuffer));
 }
 
 /*
@@ -75,25 +56,21 @@ static void _checkCudaErrorAux(const char *file, unsigned line, const char *stat
  * CUDA kernel block
  */
 
-__global__ void kernel(double * __restrict__ z, double * __restrict__ y, double * __restrict__ x,
-					   double * __restrict__ yBuf, double * __restrict__ xBuf,
+__global__ void kernel(double * __restrict__ data, double * __restrict__ buffer,
 					   const std::size_t size,
 					   const double phaseVelocity, const double outerForse,
 					   const double stepX, const double stepY,
 					   const double stepT, const double maxTime) {
-	for (auto t = 0.0; t < maxTime; t += stepT) {
-		auto idx = threadIdx.x + blockIdx.x * blockDim.x;
+	auto idx = threadIdx.x + blockIdx.x * blockDim.x;
 
+	for (auto t = 0.0; t < maxTime; t += stepT) {
 		if (idx < size) {
-			xBuf[idx] = (x[idx + 1] + x[idx - 1] + 2.0 * x[idx]) / (stepX * stepX);
-			yBuf[idx] = (y[idx + 1] + y[idx - 1] - 2.0 * y[idx]) / (stepY * stepY);
-			z[idx]    = (stepT * stepT) * (phaseVelocity * phaseVelocity * (xBuf[idx] + yBuf[idx]) + outerForse);
-			printf("%d\n", z[idx]);
+			buffer[idx] = (stepT * stepT) * (phaseVelocity * phaseVelocity * ((data[idx + 1] + data[idx - 1] - 2.0 * data[idx]) / (stepX * stepX) + 
+				                                                              (data[idx + 1] + data[idx - 1] - 2.0 * data[idx]) / (stepY * stepY) + outerForse)) + data[idx];
 
 			__syncthreads();
 
-			x[idx] = xBuf[idx];
-			y[idx] = yBuf[idx];
+			data[idx] = buffer[idx];
 
 			__syncthreads();
 		}
@@ -105,21 +82,11 @@ __global__ void kernel(double * __restrict__ z, double * __restrict__ y, double 
  */
 
 int cpuInit(std::size_t size) {
-	::hostDataX = (double *)std::calloc(size, sizeof(double));
-	if (!::hostDataX)
+	::hostData = (double *)std::calloc(size, sizeof(double));
+	if (!::hostData)
 		return 1;
 
-	::hostDataY = (double *)std::calloc(size, sizeof(double));
-	if (!::hostDataY)
-		return 1;
-
-	::hostDataZ = (double *)std::calloc(size, sizeof(double));
-	if (!::hostDataZ)
-		return 1;
-
-	std::memset(::hostDataX, 0, size);
-	std::memset(::hostDataY, 0, size);
-	std::memset(::hostDataZ, 0, size);
+	std::memset(::hostData, 0, size);
 
 	return 0;
 }
@@ -127,19 +94,36 @@ int cpuInit(std::size_t size) {
 void gpuInit(std::size_t size) {
 	auto byteSize = size * sizeof(double);
 
-	cudaCheck(cudaMalloc((void **)&::devDataX, byteSize));
-	cudaCheck(cudaMalloc((void **)&::devDataY, byteSize));
-	cudaCheck(cudaMalloc((void **)&::devDataZ, byteSize));
-	cudaCheck(cudaMalloc((void **)&::devDataBufX, byteSize));
-	cudaCheck(cudaMalloc((void **)&::devDataBufY, byteSize));
-	cudaCheck(cudaMalloc((void **)&::devDataBufZ, byteSize));
+	cudaCheck(cudaMalloc((void **)&::devData, byteSize));
+	cudaCheck(cudaMalloc((void **)&::devBuffer, byteSize));
 
-	cudaCheck(cudaMemset(::devDataX, 0, byteSize));
-	cudaCheck(cudaMemset(::devDataY, 0, byteSize));
-	cudaCheck(cudaMemset(::devDataZ, 0, byteSize));
-	cudaCheck(cudaMemset(::devDataBufX, 0, byteSize));
-	cudaCheck(cudaMemset(::devDataBufY, 0, byteSize));
-	cudaCheck(cudaMemset(::devDataBufZ, 0, byteSize));
+	cudaCheck(cudaMemset(::devData, 0, byteSize));
+	cudaCheck(cudaMemset(::devBuffer, 0, byteSize));
+}
+
+/*
+ * Helpers
+ */
+
+int printResultToGnuplotFile(const char *filename, const double *result, std::size_t size, double stepX) {
+	std::ofstream ofs(filename, std::ios_base::out | std::ios_base::trunc);
+
+	if (!ofs.is_open())
+		return 1;
+
+	ofs << "plot '-'" << std::endl;
+
+	auto x = 0.0;
+	for (auto i = 0; i < size; i++) {
+		ofs << x << "\t" << result[i] << std::endl;
+		x += stepX;
+	}
+
+	ofs << "e" << std::endl;
+
+	ofs.close();
+
+	return 0;
 }
 
 /*
@@ -162,14 +146,21 @@ int main() {
 	dim3 nBlocks(1);
 	dim3 nThreads(256);
 
-	kernel <<<nBlocks, nThreads>>> (devDataZ, devDataY, devDataX, devDataBufY, devDataBufX, size,
+	kernel <<<nBlocks, nThreads>>> (devData, devBuffer, size,
 									PHASE_VEL, OUTER_FORSE, STEP_X, STEP_Y, STEP_T, maxTime);
 
-	cudaCheck(cudaMemcpy(hostDataZ, devDataZ, size * sizeof(double), cudaMemcpyDeviceToHost));
+	cudaCheck(cudaMemcpy(hostData, devData, size * sizeof(double), cudaMemcpyDeviceToHost));
 
 	for (auto i = 0; i < size; i++)
-		std::cout << hostDataZ[i] << " ";
+		std::cout << hostData[i] << " ";
 	std::cout << std::endl;
+
+	if (printResultToGnuplotFile("result.txt", hostData, size, STEP_X)) {
+		std::cout << "Unable to print to file" << std::endl;
+		_cpuFree();
+		_gpuFree();
+		return 1;
+	}
 
 	_gpuFree();
 	_cpuFree();
